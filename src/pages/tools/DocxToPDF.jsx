@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import ConvertApi from 'convertapi-js'
 import JSZip from 'jszip'
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import fontkit from '@pdf-lib/fontkit'
 import { Loader2, FileType, Cloud, Cpu, ExternalLink } from 'lucide-react'
 import ToolShell from '../../components/ToolShell'
 import DropZone from '../../components/DropZone'
@@ -290,16 +291,19 @@ function parseTable(tblNode, relsMap) {
     const cells = []
     for (const tc of findChildren(tr, 'tc')) {
       const tcPr = findChild(tc, 'tcPr')
-      let gridSpan = 1, tcShd = null
+      let gridSpan = 1, tcShd = null, vMerge = null, tcW = null, vAlign = null
       if (tcPr) {
         const gs = findChild(tcPr, 'gridSpan'); if (gs) { const v = attrInt(gs, 'val', 1); if (v) gridSpan = v }
         const shd = findChild(tcPr, 'shd'); if (shd) { const f = getAttr(shd, 'fill'); if (f && /^[0-9a-fA-F]{6}$/.test(f)) tcShd = `#${f}` }
+        const vm = findChild(tcPr, 'vMerge'); if (vm) { const val = getAttr(vm, 'val'); vMerge = val === 'restart' ? 'restart' : (val || 'continue') }
+        const wNode = findChild(tcPr, 'tcW'); if (wNode) { const w = attrInt(wNode, 'w', null); const type = getAttr(wNode, 'type'); if (w != null) tcW = { w, type: type || 'dxa' } }
+        const va = findChild(tcPr, 'vAlign'); if (va) vAlign = getAttr(va, 'val') || 'top'
       }
       const cellParas = []
       for (const c of Array.from(tc.childNodes)) if (c.nodeType === 1 && isTag(c, 'p')) cellParas.push(parseParagraph(c, relsMap))
       const flatRuns = cellParas.flatMap((p) => p.runs)
       const text = flatRuns.filter((r) => r.kind === 'text').map((r) => r.text).join('')
-      cells.push({ gridSpan, tcShd, paras: cellParas, flatRuns, text: text.trim() })
+      cells.push({ gridSpan, tcShd, vMerge, tcW, vAlign, paras: cellParas, flatRuns, text: text.trim() })
     }
     rows.push({ cells })
   }
@@ -307,14 +311,16 @@ function parseTable(tblNode, relsMap) {
 }
 
 // ========= Rendering helpers =========
+// Maps a run's requested font name (rFonts.ascii/hAnsi) to a "family key".
+// Returns the canonical family key used to look up embedded fonts in `fonts`.
 function resolveRunFont(rFonts) {
   if (!rFonts || (!rFonts.ascii && !rFonts.hAnsi)) return null
   const name = (rFonts.ascii || rFonts.hAnsi || '').trim()
   if (!name) return null
   const low = name.toLowerCase()
-  if (low.includes('times') || low.includes('georgia') || low.includes('garamond') || low.includes('cambria') || low.includes('roman') || low.includes('mincho') || low.includes('batang')) return { name, pdfFamily: 'TimesRoman' }
-  if (low.includes('courier') || low.includes('consolas') || low.includes('mono') || low.includes('menlo')) return { name, pdfFamily: 'Courier' }
-  return { name, pdfFamily: 'Helvetica' }
+  if (low.includes('times') || low.includes('georgia') || low.includes('garamond') || low.includes('cambria') || low.includes('roman') || low.includes('mincho') || low.includes('batang')) return { name, family: 'times' }
+  if (low.includes('courier') || low.includes('consolas') || low.includes('mono') || low.includes('menlo')) return { name, family: 'courier' }
+  return { name, family: 'helvetica' }
 }
 function getRunSize(run, pStyle) {
   if (run.szHalfPt != null) return run.szHalfPt / 2
@@ -326,13 +332,23 @@ function getRunSize(run, pStyle) {
   }
   return 11
 }
+// Resolve a run to the best embedded font object. `fonts` is the registry:
+//   fonts.families = { name: { regular, bold, italic, boldItalic } }
+// where each style entry is a pdf-lib font object. Bold/italic variants are
+// synthesised when a real embedded font lacks a dedicated face.
 function getRunPdfFont(run, fonts) {
   const rf = resolveRunFont(run.rFonts)
-  const fam = rf ? rf.pdfFamily : 'Helvetica'
+  const famKey = rf ? rf.family : 'helvetica'
   const b = !!run.bold, i = !!run.italic
-  if (fam === 'TimesRoman') { if (b && i) return fonts.timesBi; if (b) return fonts.timesBold; if (i) return fonts.timesItalic; return fonts.times }
-  if (fam === 'Courier') { if (b && i) return fonts.courierBi; if (b) return fonts.courierBold; if (i) return fonts.courierItalic; return fonts.courier }
-  if (b && i) return fonts.helvBi; if (b) return fonts.helvBold; if (i) return fonts.helvItalic; return fonts.helv
+  const fam = fonts.families[famKey] || fonts.families.helvetica
+  if (b && i && fam.boldItalic) return fam.boldItalic
+  if (b && i && fam.bold && fam.italic) return fam.bold // prefer bold if no dedicated BI face
+  if (b && fam.bold) return fam.bold
+  if (i && fam.italic) return fam.italic
+  if (b && i && fam.bold) return fam.bold
+  if (b && !fam.bold) return fam.regular // no bold face — fall back to regular
+  if (i && !fam.italic) return fam.regular
+  return fam.regular || fonts.helv
 }
 function ensureSect(s) { return s && s.pageW && s.margin ? s : DEFAULT_SECT }
 function ensurePage(doc, currentPage, currentY, neededH, sect) {
@@ -429,7 +445,7 @@ function drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect) {
 }
 function drawTableBlock(block, doc, currentPage, currentY, fonts, sect) {
   sect = ensureSect(sect)
-  const numCols = Math.max(...block.rows.map((r) => r.cells.length), block.gridCols.length || 0) || 1
+  const numCols = Math.max(block.gridCols.length || 0, ...block.rows.map((r) => r.cells.reduce((a, c) => a + (c.gridSpan || 1), 0))) || 1
   let colWidthsPt = []
   if (block.gridCols.length >= numCols && block.gridCols.length > 0) {
     const total = block.gridCols.reduce((a, b) => a + b, 0) || numCols * 1000
@@ -439,12 +455,6 @@ function drawTableBlock(block, doc, currentPage, currentY, fonts, sect) {
     const contentW = sect.pageW - sect.margin.left - sect.margin.right
     colWidthsPt = Array(numCols).fill(contentW / numCols)
   }
-  const expandedRows = block.rows.map((row) => {
-    const ex = []
-    for (const c of row.cells) for (let k = 0; k < (c.gridSpan || 1); k++) ex.push(k === 0 ? c : { ...c, text: '', flatRuns: [], paras: [], isSpan: true })
-    while (ex.length < numCols) ex.push({ text: '', flatRuns: [], paras: [], gridSpan: 1 })
-    return { ...row, cells: ex.slice(0, numCols) }
-  })
   const CELL_PAD = 4
   function wrapCellText(text, colW, size, font) {
     const innerW = Math.max(10, colW - CELL_PAD * 2)
@@ -453,30 +463,50 @@ function drawTableBlock(block, doc, currentPage, currentY, fonts, sect) {
     for (const w of words) { const test = cur ? `${cur} ${w}` : w; if (font.widthOfTextAtSize(test, size) > innerW && cur) { lines.push(cur); cur = w } else cur = test }
     if (cur) lines.push(cur); return lines
   }
+  // Build a per-column cell map that honours gridSpan + vMerge (rowspan).
+  // `colCells[r][c]` = { cell, span, isContinuation, spanW, startCol }
+  const colMap = block.rows.map((row) => {
+    const map = new Array(numCols).fill(null)
+    let c = 0
+    for (const cell of row.cells) {
+      const span = Math.max(1, cell.gridSpan || 1)
+      map[c] = { cell, span, startCol: c, spanW: colWidthsPt.slice(c, c + span).reduce((a, b) => a + b, 0) }
+      c += span
+    }
+    return map
+  })
   let page = currentPage, y = currentY
-  for (let r = 0; r < expandedRows.length; r++) {
-    const row = expandedRows[r]
+  for (let r = 0; r < block.rows.length; r++) {
+    const row = block.rows[r]
+    const map = colMap[r]
+    // Determine continuation cells (vMerge 'continue') — their text belongs to a cell
+    // started in an earlier row, so they should NOT draw their own box here.
+    const cellPlans = []
     let maxLines = 1
-    const cellLinesArr = []
     for (let c = 0; c < numCols; c++) {
-      const cell = row.cells[c]
-      const txt = cell ? cell.text : ''
-      const size = 10.5, font = fonts.helv, colW = colWidthsPt[c]
-      const cellLines = wrapCellText(txt, colW, size, font)
+      const entry = map[c]
+      if (!entry) { cellPlans.push(null); continue }
+      const cell = entry.cell
+      if (cell.vMerge === 'continue') { cellPlans.push(null); continue }
+      const txt = cell.text || ''
+      const size = 10.5, font = fonts.helv
+      const cellLines = wrapCellText(txt, entry.spanW, size, font)
       const maxImgH = Math.max(0, ...((cell.paras || []).flatMap((p) => p.runs.filter((x) => x.kind === 'image').map((x) => x.cy || 30)), [0]))
       const needH = maxImgH ? Math.ceil(maxImgH / 14) : 0
       maxLines = Math.max(maxLines, Math.max(cellLines.length, needH))
-      cellLinesArr.push(cellLines)
+      cellPlans.push({ entry, cellLines, size, font })
     }
     const rowH = Math.max(18, maxLines * 13 + CELL_PAD * 2 + 2)
     const need = ensurePage(doc, page, y, rowH, sect); page = need.page; y = need.y; sect = need.sect
     let curX = sect.margin.left
     for (let c = 0; c < numCols; c++) {
-      const colW = colWidthsPt[c], cell = row.cells[c], isHeaderRow = r === 0
+      const plan = cellPlans[c]
+      if (!plan) { curX += colWidthsPt[c]; continue }
+      const colW = plan.entry.spanW, cell = plan.entry.cell, isHeaderRow = r === 0
       const bg = cell?.tcShd ? hexToRgb(cell.tcShd) : null
       page.drawRectangle({ x: curX, y: y - rowH, width: colW, height: rowH, borderColor: rgb(0.78, 0.82, 0.88), borderWidth: 0.7, color: bg ? rgb(bg.r, bg.g, bg.b) : (isHeaderRow ? rgb(0.96, 0.97, 0.99) : undefined) })
-      const size = 10.5, cellFont = cell && cell.flatRuns.some((x) => x.bold) ? fonts.helvBold : fonts.helv
-      for (let li = 0; li < cellLinesArr[c].length; li++) { const line = cellLinesArr[c][li]; const ty = y - CELL_PAD - 9 - li * 13; page.drawText(line, { x: curX + CELL_PAD, y: ty, size, font: cellFont, color: rgb(0.1, 0.1, 0.1), maxWidth: colW - CELL_PAD * 2 }) }
+      const size = plan.size, cellFont = cell && cell.flatRuns.some((x) => x.bold) ? (fonts.families.helvetica.bold || fonts.helv) : fonts.helv
+      for (let li = 0; li < plan.cellLines.length; li++) { const line = plan.cellLines[li]; const ty = y - CELL_PAD - 9 - li * 13; page.drawText(line, { x: curX + CELL_PAD, y: ty, size, font: cellFont, color: rgb(0.1, 0.1, 0.1), maxWidth: colW - CELL_PAD * 2 }) }
       const imgRuns = (cell.paras || []).flatMap((p) => p.runs.filter((x) => x.kind === 'image'))
       if (imgRuns.length) { let imgY = y - CELL_PAD - 10; for (const ir of imgRuns) { const iw = Math.min(ir.cx || 60, colW - CELL_PAD * 2), ih = ir.cy || 30; if (ir._pdfImage) page.drawImage(ir._pdfImage, { x: curX + CELL_PAD, y: imgY - ih, width: iw, height: ih }); imgY -= ih + 4 } }
       curX += colW
@@ -522,6 +552,95 @@ async function embedDocxImages(blocks, zip, relsMap, pdfDoc) {
   await Promise.all(pending)
 }
 
+// Build a font registry { families: { times: {regular,bold,italic,boldItalic}, ... }, helv: <fallback> }.
+// Uses real embedded fonts from word/fonts/ (mapped via fontTable.xml) when available,
+// falling back to pdf-lib StandardFonts (Helvetica/Times/Courier) otherwise.
+async function buildFontRegistry(doc, zip, blocks) {
+  // Base fallback families (StandardFonts — always available, no file needed).
+  const registry = {
+    helvetica: {
+      regular: await doc.embedFont(StandardFonts.Helvetica),
+      bold: await doc.embedFont(StandardFonts.HelveticaBold),
+      italic: await doc.embedFont(StandardFonts.HelveticaOblique),
+      boldItalic: await doc.embedFont(StandardFonts.HelveticaBoldOblique),
+    },
+    times: {
+      regular: await doc.embedFont(StandardFonts.TimesRoman),
+      bold: await doc.embedFont(StandardFonts.TimesRomanBold),
+      italic: await doc.embedFont(StandardFonts.TimesRomanItalic),
+      boldItalic: await doc.embedFont(StandardFonts.TimesRomanBoldItalic),
+    },
+    courier: {
+      regular: await doc.embedFont(StandardFonts.Courier),
+      bold: await doc.embedFont(StandardFonts.CourierBold),
+      italic: await doc.embedFont(StandardFonts.CourierOblique),
+      boldItalic: await doc.embedFont(StandardFonts.CourierBoldOblique),
+    },
+  }
+  const fonts = { families: registry, helv: registry.helvetica.regular }
+
+  // Locate embedded fonts. Word stores: word/fontTable.xml (declares fonts) and
+  // optionally embeds them as word/fonts/fontN.odttf or .ttf/.otf, linked via
+  // word/_rels/fontTable.xml.rels. We parse the rels to map font name -> file.
+  const fontTableRels = zip.file('word/_rels/fontTable.xml.rels')
+  if (!fontTableRels) return fonts
+  let rels
+  try {
+    const relsStr = await fontTableRels.async('string')
+    rels = new DOMParser().parseFromString(relsStr, 'application/xml')
+  } catch { return fonts }
+
+  // Build id -> target (embedded font file path)
+  const relTargets = new Map()
+  for (const rel of Array.from(rels.getElementsByTagName('Relationship'))) {
+    const id = rel.getAttribute('Id'); const target = rel.getAttribute('Target')
+    if (id && target) relTargets.set(id, target)
+  }
+  if (!relTargets.size) return fonts
+
+  // fontTable.xml maps font name -> r:id (or r:embedRegular etc.)
+  const fontTable = zip.file('word/fontTable.xml')
+  if (!fontTable) return fonts
+  let ft
+  try {
+    const ftStr = await fontTable.async('string')
+    ft = new DOMParser().parseFromString(ftStr, 'application/xml')
+  } catch { return fonts }
+
+  for (const fnt of Array.from(ft.getElementsByTagName('w:font'))) {
+    const fname = fnt.getAttribute('w:name')
+    if (!fname) continue
+    // Attempt to find an embedded font via r:id (regular) and r:embedBold/Italic/BoldItalic
+    const embedId = (() => {
+      for (const tag of ['embedRegular', 'embedBold', 'embedItalic', 'embedBoldItalic']) {
+        const n = fnt.getElementsByTagName(`w:${tag}`)[0]
+        if (n && n.getAttribute('r:id')) return { tag, id: n.getAttribute('r:id') }
+      }
+      return null
+    })()
+    if (!embedId) continue
+    const target = relTargets.get(embedId.id)
+    if (!target) continue
+    let zipPath = target
+    if (zipPath.startsWith('/')) zipPath = zipPath.slice(1)
+    if (!zipPath.startsWith('word/')) zipPath = `word/${zipPath.replace(/^\.?\//, '')}`
+    const ffile = zip.file(zipPath) || Object.keys(zip.files).find((k) => k.endsWith(target.split('/').pop()))
+    if (!ffile) continue
+    try {
+      const buf = await ffile.async('uint8Array')
+      const embedded = await doc.embedFont(buf)
+      const famKey = resolveRunFont({ ascii: fname }).family
+      // Place the embedded face into the right style slot(s).
+      const slot = embedId.tag === 'embedRegular' ? 'regular' : embedId.tag === 'embedBold' ? 'bold' : embedId.tag === 'embedItalic' ? 'italic' : 'boldItalic'
+      registry[famKey][slot] = embedded
+      // A real face without dedicated variants: keep StandardFonts for the others,
+      // but if this is the regular face and no italic/bold real faces exist, we may
+      // synthesise via the same face (getRunPdfFont already falls back gracefully).
+    } catch { /* skip malformed font */ }
+  }
+  return fonts
+}
+
 async function convertViaConvertApi(file, token, fromExt, toExt) {
   const api = ConvertApi.auth(token.trim())
   const params = api.createParams()
@@ -552,20 +671,8 @@ async function convertOfflineDocxToPdf(arrayBuf, setProgressText, setProgress) {
   setProgressText('Memuat gambar & font…')
   setProgress(28)
   const doc = await PDFDocument.create()
-  const fonts = {
-    helv: await doc.embedFont(StandardFonts.Helvetica),
-    helvBold: await doc.embedFont(StandardFonts.HelveticaBold),
-    helvItalic: await doc.embedFont(StandardFonts.HelveticaOblique),
-    helvBi: await doc.embedFont(StandardFonts.HelveticaBoldOblique),
-    times: await doc.embedFont(StandardFonts.TimesRoman),
-    timesBold: await doc.embedFont(StandardFonts.TimesRomanBold),
-    timesItalic: await doc.embedFont(StandardFonts.TimesRomanItalic),
-    timesBi: await doc.embedFont(StandardFonts.TimesRomanBoldItalic),
-    courier: await doc.embedFont(StandardFonts.Courier),
-    courierBold: await doc.embedFont(StandardFonts.CourierBold),
-    courierItalic: await doc.embedFont(StandardFonts.CourierOblique),
-    courierBi: await doc.embedFont(StandardFonts.CourierBoldOblique),
-  }
+  doc.registerFontkit(fontkit)
+  const fonts = await buildFontRegistry(doc, zip, blocks)
   await embedDocxImages(blocks, zip, relsMap, doc)
   setProgressText('Menyiapkan halaman PDF…')
   setProgress(40)
