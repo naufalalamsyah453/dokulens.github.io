@@ -144,7 +144,98 @@ async function parseDocxXml(arrayBuf) {
       }
     }
   }
-  return { blocks, defaultSect, relsMap, zip }
+  // Numbering (word/numbering.xml) → map numId -> { ilvl -> { format, text } }
+  const numbering = await parseNumbering(zip)
+  // Header/footer references per section (default sect at body level)
+  const headerFooter = await parseHeaderFooter(zip, relsMap, defaultSect)
+  return { blocks, defaultSect, relsMap, zip, numbering, headerFooter }
+}
+
+async function parseNumbering(zip) {
+  const map = {}
+  const f = zip.file('word/numbering.xml')
+  if (!f) return map
+  try {
+    const str = await f.async('string')
+    const doc = new DOMParser().parseFromString(str, 'application/xml')
+    // abstractNum definitions
+    const abstractNums = {}
+    for (const an of Array.from(doc.getElementsByTagName('w:abstractNum'))) {
+      const anId = an.getAttribute('w:abstractNumId')
+      const levels = {}
+      for (const lvl of Array.from(an.getElementsByTagName('w:lvl'))) {
+        const ilvl = parseInt(lvl.getAttribute('w:ilvl') || '0', 10)
+        const fmt = (lvl.getElementsByTagName('w:numFmt')[0]?.getAttribute('w:val')) || 'decimal'
+        let text = (lvl.getElementsByTagName('w:lvlText')[0]?.getAttribute('w:val')) || '%1.'
+        levels[ilvl] = { format: fmt, text }
+      }
+      abstractNums[anId] = levels
+    }
+    // num -> abstractNumId mapping
+    for (const num of Array.from(doc.getElementsByTagName('w:num'))) {
+      const numId = num.getAttribute('w:numId')
+      const ref = num.getElementsByTagName('w:abstractNumId')[0]?.getAttribute('w:val')
+      if (numId != null && ref != null && abstractNums[ref]) map[numId] = abstractNums[ref]
+    }
+  } catch {}
+  return map
+}
+
+async function parseHeaderFooter(zip, relsMap, defaultSect) {
+  const result = { headerBlocks: [], footerBlocks: [], headerRels: new Map(), footerRels: new Map() }
+  // Find header/footer references from any sectPr. We scan document.xml sectPr for headerReference/footerReference.
+  const docFile = zip.file('word/document.xml')
+  if (!docFile) return result
+  try {
+    const xmlStr = await docFile.async('string')
+    const xmlDoc = new DOMParser().parseFromString(xmlStr, 'application/xml')
+    const refs = xmlDoc.getElementsByTagName('w:headerReference')
+    const footerRefs = xmlDoc.getElementsByTagName('w:footerReference')
+    let headerPath = null, footerPath = null
+    for (const hr of Array.from(refs)) {
+      const rid = hr.getAttribute('r:id'); const type = hr.getAttribute('w:type')
+      if (rid && type !== 'first' && type !== 'even') { headerPath = relsMap.get(rid) || null; break }
+    }
+    for (const fr of Array.from(footerRefs)) {
+      const rid = fr.getAttribute('r:id'); const type = fr.getAttribute('w:type')
+      if (rid && type !== 'first' && type !== 'even') { footerPath = relsMap.get(rid) || null; break }
+    }
+    // Resolve & parse header/footer XML (they are themselves mini-documents)
+    if (headerPath) {
+      let hp = headerPath; if (hp.startsWith('/')) hp = hp.slice(1)
+      const hf = zip.file(hp) || Object.keys(zip.files).find((k) => k.endsWith(hp.split('/').pop()))
+      if (hf) {
+        const hStr = await hf.async('string')
+        const hDoc = new DOMParser().parseFromString(hStr, 'application/xml')
+        // parse paragraphs/tables within header (reuse parseParagraph/parseTable via a mini relsMap)
+        const hBlocks = []
+        const body = hDoc.getElementsByTagName('w:hdr')[0] || hDoc.documentElement
+        for (const node of Array.from(body.childNodes)) {
+          if (node.nodeType !== 1) continue
+          if (isTag(node, 'p')) hBlocks.push(parseParagraph(node, relsMap))
+          else if (isTag(node, 'tbl')) hBlocks.push(parseTable(node, relsMap))
+        }
+        result.headerBlocks = hBlocks
+      }
+    }
+    if (footerPath) {
+      let fp = footerPath; if (fp.startsWith('/')) fp = fp.slice(1)
+      const ff = zip.file(fp) || Object.keys(zip.files).find((k) => k.endsWith(fp.split('/').pop()))
+      if (ff) {
+        const fStr = await ff.async('string')
+        const fDoc = new DOMParser().parseFromString(fStr, 'application/xml')
+        const fBlocks = []
+        const body = fDoc.getElementsByTagName('w:ftr')[0] || fDoc.documentElement
+        for (const node of Array.from(body.childNodes)) {
+          if (node.nodeType !== 1) continue
+          if (isTag(node, 'p')) fBlocks.push(parseParagraph(node, relsMap))
+          else if (isTag(node, 'tbl')) fBlocks.push(parseTable(node, relsMap))
+        }
+        result.footerBlocks = fBlocks
+      }
+    }
+  } catch {}
+  return result
 }
 
 function parseParagraph(pNode, relsMap) {
@@ -153,7 +244,11 @@ function parseParagraph(pNode, relsMap) {
   if (pPr) {
     const s = findChild(pPr, 'pStyle'); if (s) pStyle = getAttr(s, 'val')
     const j = findChild(pPr, 'jc'); if (j) jc = getAttr(j, 'val')
-    const np = findChild(pPr, 'numPr'); if (np) numPr = true
+    const np = findChild(pPr, 'numPr')
+    if (np) {
+      const ilvlNode = findChild(np, 'ilvl'); const numIdNode = findChild(np, 'numId')
+      numPr = { ilvl: attrInt(ilvlNode, 'val', 0), numId: attrInt(numIdNode, 'val', null) }
+    }
     const indNode = findChild(pPr, 'ind')
     if (indNode) {
       const l = attrInt(indNode, 'left', null); if (l != null) ind.left = twipToPt(l)
@@ -177,6 +272,18 @@ function parseParagraph(pNode, relsMap) {
   for (const child of Array.from(pNode.childNodes)) {
     if (isTag(child, 'r')) collectRunsFromR(child, runs, relsMap, false)
     else if (isTag(child, 'hyperlink')) for (const r of Array.from(child.childNodes)) if (r.nodeType === 1 && isTag(r, 'r')) collectRunsFromR(r, runs, relsMap, true)
+    else if (isTag(child, 'fldSimple')) {
+      // e.g. <w:fldSimple w:instr=" PAGE "/> or " NUMPAGES "
+      const instr = getAttr(child, 'instr') || ''
+      const trimmed = instr.trim().toUpperCase()
+      if (trimmed === 'PAGE') runs.push({ kind: 'field', field: 'PAGE' })
+      else if (trimmed === 'NUMPAGES') runs.push({ kind: 'field', field: 'NUMPAGES' })
+      else if (trimmed === 'PAGE' || trimmed === 'PAGEREF') runs.push({ kind: 'field', field: 'PAGE' })
+      else if (trimmed === 'DATE' || trimmed === 'TIME') runs.push({ kind: 'field', field: trimmed })
+      else { // render its run content as plain text
+        for (const r of Array.from(child.childNodes)) if (r.nodeType === 1 && isTag(r, 'r')) collectRunsFromR(r, runs, relsMap, false)
+      }
+    }
     else if (isTag(child, 'proofErr') || isTag(child, 'bookmarkStart') || isTag(child, 'bookmarkEnd') || isTag(child, 'pPr')) continue
   }
   return { type: 'paragraph', runs, pStyle, jc, ind, spacing, tabs, shdFill, numPr }
@@ -213,6 +320,11 @@ function collectRunsFromR(rNode, out, relsMap, forceUnderline = false) {
     } else if (isTag(rc, 'tab')) out.push({ kind: 'tab', text: '\t', bold, italic, underline, strike, szHalfPt, colorHex, highlightHex, vertAlign, rFonts, isTab: true })
     else if (isTag(rc, 'br')) out.push({ kind: 'break', text: '\n', isBreak: true })
     else if (isTag(rc, 'cr')) out.push({ kind: 'break', text: '\n', isBreak: true })
+    else if (isTag(rc, 'instrText')) {
+      const ins = (rc.textContent || '').trim().toUpperCase()
+      if (ins === 'PAGE') out.push({ kind: 'field', field: 'PAGE' })
+      else if (ins === 'NUMPAGES') out.push({ kind: 'field', field: 'NUMPAGES' })
+    }
     else if (isTag(rc, 'drawing')) { const d = parseDrawing(rc, relsMap); if (d) out.push({ kind: 'image', ...d }) }
     else if (isTag(rc, 'pict')) { const d2 = parsePict(rc, relsMap); if (d2) out.push({ kind: 'image', ...d2 }) }
     else if (isTag(rc, 'object')) { const d3 = parseObject(rc, relsMap); if (d3) out.push({ kind: 'image', ...d3 }) }
@@ -359,9 +471,19 @@ function ensurePage(doc, currentPage, currentY, neededH, sect) {
   }
   return { page: currentPage, y: currentY, sect }
 }
-function drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect) {
+function drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect, numbering, pageNum) {
+  // Handle fields (PAGE, NUMPAGES) in paragraph text
+  let processedRuns = []
+  for (const run of block.runs) {
+    if (run.kind === 'field') {
+      if (run.field === 'PAGE') processedRuns.push({ kind: 'text', text: String(pageNum), size: getRunSize(run, block.pStyle), font: getRunPdfFont(run, fonts) })
+      else if (run.field === 'NUMPAGES') processedRuns.push({ kind: 'text', text: String(doc.getPageCount()), size: getRunSize(run, block.pStyle), font: getRunPdfFont(run, fonts) })
+    } else {
+      processedRuns.push(run)
+    }
+  }
   sect = ensureSect(sect)
-  const runs = block.runs
+  const runs = processedRuns
   const contentW = sect.pageW - sect.margin.left - sect.margin.right
   const hasVisible = runs.some((r) => r.kind === 'text' ? r.text?.trim() : r.kind !== 'break')
   if (!hasVisible) { const gap = (block.spacing?.after || 0) + (block.spacing?.before || 0); return { page: currentPage, y: currentY - (gap || 6), sect } }
@@ -442,6 +564,57 @@ function drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect) {
   }
   y -= (block.spacing?.after || 4)
   return { page, y, sect }
+}
+// Draw a header/footer block (header or footer paragraphs). Fields are replaced with values.
+function drawHeaderFooterBlock(block, page, currentY, fonts, numbering, pageNum, totalPages, context) {
+  const runs = block.runs
+  const contentW = page.getWidth() - 2 * 36
+  if (!runs.length) return { page, y: currentY }
+  const lines = []
+  let curLine = [], curW = 0
+  const flush = () => { if (curLine.length) lines.push(curLine); curLine = []; curW = 0 }
+  for (const run of runs) {
+    if (run.kind === 'break') { flush(); continue }
+    if (run.kind === 'field') {
+      let txt = ''
+      if (run.field === 'PAGE') txt = String(pageNum)
+      else if (run.field === 'NUMPAGES') txt = String(totalPages)
+      else txt = ''
+      if (txt) {
+        const w = fonts.helv.widthOfTextAtSize(txt, 10)
+        curLine.push({ kind: 'text', text: txt, width: w, size: 10, font: fonts.helv })
+        curW += w
+      }
+      continue
+    }
+    if (run.kind === 'tab' || run.isTab) {
+      const tabW = 36; if (curW + tabW > contentW && curLine.length) flush()
+      curLine.push({ kind: 'text', text: '    ', width: tabW, size: 10, font: fonts.helv, isTab: true }); curW += tabW; continue
+    }
+    const text = String(run.text || '')
+    if (!text) continue
+    const w = fonts.helv.widthOfTextAtSize(text, 10)
+    if (curW + w > contentW && curLine.length) flush()
+    curLine.push({ kind: 'text', text, width: w, size: 10, font: fonts.helv }); curW += w
+  }
+  flush()
+  let y = currentY
+  const pageW = page.getWidth()
+  for (let i = 0; i < lines.length; i++) {
+    const segs = lines[i]
+    const lineW = segs.reduce((a, s) => a + (s.width || 0), 0)
+    let x = (pageW - lineW) / 2
+    // Respect paragraph alignment when present
+    if (block.jc === 'left') x = 36
+    else if (block.jc === 'right') x = pageW - 36 - lineW
+    let curX = x
+    for (const seg of segs) {
+      page.drawText(seg.text, { x: curX, y, size: seg.size, font: seg.font, color: rgb(0.2, 0.2, 0.2) })
+      curX += seg.width
+    }
+    y -= 14
+  }
+  return { page, y: y - 6 }
 }
 function drawTableBlock(block, doc, currentPage, currentY, fonts, sect) {
   sect = ensureSect(sect)
@@ -666,7 +839,7 @@ async function convertViaConvertApi(file, token, fromExt, toExt) {
 async function convertOfflineDocxToPdf(arrayBuf, setProgressText, setProgress) {
   let parsed
   try { parsed = await parseDocxXml(arrayBuf) } catch (e) { throw new Error(`Gagal baca document.xml: ${e.message}`) }
-  const { blocks, defaultSect, zip, relsMap } = parsed
+  const { blocks, defaultSect, zip, relsMap, numbering, headerFooter } = parsed
   if (!blocks.length) throw new Error('Dokumen kosong atau tidak ada paragraf/tabel terbaca')
   setProgressText('Memuat gambar & font…')
   setProgress(28)
@@ -674,11 +847,15 @@ async function convertOfflineDocxToPdf(arrayBuf, setProgressText, setProgress) {
   doc.registerFontkit(fontkit)
   const fonts = await buildFontRegistry(doc, zip, blocks)
   await embedDocxImages(blocks, zip, relsMap, doc)
+  // Also embed images used inside header/footer paragraphs
+  const hfBlocks = [...(headerFooter.headerBlocks || []), ...(headerFooter.footerBlocks || [])]
+  if (hfBlocks.length) await embedDocxImages(hfBlocks, zip, relsMap, doc)
   setProgressText('Menyiapkan halaman PDF…')
   setProgress(40)
   let sect = ensureSect({ ...defaultSect })
   let currentPage = doc.addPage([sect.pageW, sect.pageH])
   let currentY = sect.pageH - sect.margin.top
+  let pageNum = 1
   setProgressText('Merender layout koordinat (X,Y) — 1:1 kertas & posisi…')
   setProgress(50)
   for (let idx = 0; idx < blocks.length; idx++) {
@@ -689,17 +866,39 @@ async function convertOfflineDocxToPdf(arrayBuf, setProgressText, setProgress) {
       if (Math.abs(nextSect.pageW - curW) > 0.5 || Math.abs(nextSect.pageH - curH) > 0.5) {
         currentPage = doc.addPage([nextSect.pageW, nextSect.pageH])
         currentY = nextSect.pageH - nextSect.margin.top
+        pageNum++
       }
       sect = nextSect; continue
     }
     if (block.type === 'paragraph') {
-      const res = drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect)
+      const res = drawParagraphBlock(block, doc, currentPage, currentY, fonts, sect, numbering, pageNum)
       currentPage = res.page; currentY = res.y; sect = ensureSect(res.sect)
     } else if (block.type === 'table') {
       const res = drawTableBlock(block, doc, currentPage, currentY, fonts, sect)
       currentPage = res.page; currentY = res.y; sect = ensureSect(res.sect)
     }
     setProgress(50 + Math.round((idx / blocks.length) * 40))
+  }
+  // Header/footer pass: draw header/footer blocks on every page
+  if (hfBlocks.length) {
+    setProgressText('Menambahkan header/footer…')
+    setProgress(92)
+    for (let p = 0; p < doc.getPageCount(); p++) {
+      const pg = doc.getPage(p)
+      const w = pg.getWidth(), h = pg.getHeight()
+      // Header at top
+      let hy = h - 36
+      for (const hb of headerFooter.headerBlocks || []) {
+        const res = drawHeaderFooterBlock(hb, pg, hy, fonts, numbering, p + 1, doc.getPageCount())
+        hy = res.y
+      }
+      // Footer at bottom
+      let fy = 36
+      for (const fb of headerFooter.footerBlocks || []) {
+        const res = drawHeaderFooterBlock(fb, pg, fy, fonts, numbering, p + 1, doc.getPageCount())
+        fy = res.y
+      }
+    }
   }
   setProgressText('Menyimpan file PDF…')
   setProgress(95)
