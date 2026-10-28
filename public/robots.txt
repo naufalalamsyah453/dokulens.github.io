@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://dokulens.github.io/sitemap.xml
+Sitemap: https://naufalalamsyah453.github.io/dokulens.github.io/sitemap.xml
