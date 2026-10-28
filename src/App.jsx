@@ -57,7 +57,7 @@ function RestoreRoute() {
 export default function App() {
   return (
     <ThemeProvider>
-      <BrowserRouter>
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, "")}>
         <RestoreRoute />
         <Suspense fallback={<PageFallback />}>
           <Routes>
