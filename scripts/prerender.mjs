@@ -18,7 +18,7 @@ const template = readFileSync(templatePath, 'utf8')
 const seoConfigUrl = new URL('../src/utils/seoConfig.js', import.meta.url)
 const { SEO_CONFIG } = await import(seoConfigUrl)
 
-const SITE_URL = 'https://naufalalamsyah453.github.io/dokulens.github.io'
+const SITE_URL = 'https://naufalalamsyah453.github.io/dokulens'
 const SITE_NAME = 'DokuLens'
 
 function brandedTitle(title) {

@@ -148,4 +148,4 @@ export function getSeoForPath(pathname) {
   return SEO_CONFIG[key] || null
 }
 
-export const DEFAULT_OG_IMAGE = 'https://naufalalamsyah453.github.io/dokulens.github.io/og-image.png'
+export const DEFAULT_OG_IMAGE = 'https://naufalalamsyah453.github.io/dokulens/og-image.png'

@@ -3,7 +3,7 @@
 // imperatively. Also injects a JSON-LD WebSite/SoftwareApplication block.
 
 const SITE_NAME = 'DokuLens'
-const SITE_URL = 'https://naufalalamsyah453.github.io/dokulens.github.io'
+const SITE_URL = 'https://naufalalamsyah453.github.io/dokulens'
 const DEFAULT_IMAGE = `${SITE_URL}/og-image.png`
 
 function upsertMeta(attr, key, content) {

@@ -51,7 +51,7 @@ export default defineConfig({
       },
     }),
   ],
-  base: '/dokulens.github.io/',
+  base: '/dokulens/',
   build: {
     rollupOptions: {
       output: {
